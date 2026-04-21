@@ -20,7 +20,7 @@ import { getFirestore, doc, getDoc, setDoc, onSnapshot }
 // │  Firebase Console → Project Settings → Your Apps → SDK      │
 // └──────────────────────────────────────────────────────────────┘
 const firebaseConfig = {
-  apiKey: "AIzaSyDxJH52XYnaTUYLyr6XQD5-IbNbO5FQcdA",
+    apiKey: "AIzaSyDxJH52XYnaTUYLyr6XQD5-IbNbO5FQcdA",
     authDomain: "kids-planner-dbc5e.firebaseapp.com",
     projectId: "kids-planner-dbc5e",
     storageBucket: "kids-planner-dbc5e.firebasestorage.app",
@@ -216,15 +216,30 @@ async function loadFamilyData() {
     const snap = await getDoc(userDocRef);
     if (snap.exists()) {
       const d = snap.data();
-      state.children              = d.children              || [];
-      state.schedules             = d.schedules             || {};
-      state.starsByChild          = d.starsByChild          || {};
-      state.badgesByChild         = d.badgesByChild         || {};
-      state.completedTasks        = d.completedTasks        || {};
-      state.completedScheduleStars= d.completedScheduleStars|| {};
-      state.dayByChild            = d.dayByChild            || {};
+      state.children               = d.children               || [];
+      state.starsByChild           = d.starsByChild           || {};
+      state.badgesByChild          = d.badgesByChild          || {};
+      state.completedTasks         = d.completedTasks         || {};
+      state.completedScheduleStars = d.completedScheduleStars || {};
+      state.dayByChild             = d.dayByChild             || {};
+
+      // ✅ Clean nested arrays immediately on load
+      state.schedules = ensureSchedulesForChildren(
+        d.children || [],
+        cleanAllSchedules(d.schedules || {})
+      );
+
+      // ✅ Save the cleaned version back to Firestore right away
+      await setDoc(userDocRef, buildPayload(), { merge: true });
+      console.log("✅ Cleaned and re-saved schedules to Firestore");
+
     } else {
-      await setDoc(userDocRef, buildPayload()); // first-time setup
+      state.children = ["Sumaiya"];
+      state.dayByChild = { Sumaiya: "mon" };
+      state.starsByChild = { Sumaiya: 0 };
+      state.badgesByChild = { Sumaiya: [] };
+      state.schedules = ensureSchedulesForChildren(state.children, {});
+      await setDoc(userDocRef, buildPayload());
     }
     state.child = state.children[0] ?? null;
   } catch (err) {
@@ -239,12 +254,18 @@ function subscribeToRemoteChanges() {
     if (!snap.exists()) return;
     const d = snap.data();
     state.children               = d.children               || state.children;
-    state.schedules              = d.schedules              || state.schedules;
     state.starsByChild           = d.starsByChild           || state.starsByChild;
     state.badgesByChild          = d.badgesByChild          || state.badgesByChild;
     state.completedTasks         = d.completedTasks         || state.completedTasks;
     state.completedScheduleStars = d.completedScheduleStars || state.completedScheduleStars;
     state.dayByChild             = d.dayByChild             || state.dayByChild;
+
+    // ✅ Always clean on every snapshot received
+    state.schedules = ensureSchedulesForChildren(
+      state.children,
+      cleanAllSchedules(d.schedules || state.schedules)
+    );
+
     if (!state.children.includes(state.child)) state.child = state.children[0] ?? null;
     renderChildManager();
     renderSelectors();
@@ -252,17 +273,136 @@ function subscribeToRemoteChanges() {
   });
 }
 
+function removeNestedArrays(obj) {
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeNestedArrays(item));
+  } else if (typeof obj === "object" && obj !== null) {
+    const newObj = {};
+    for (let key in obj) {
+      newObj[key] = removeNestedArrays(obj[key]);
+    }
+    return newObj;
+  }
+  return obj;
+}
+
 function buildPayload() {
+  const cleanSchedules = {};
+
+  for (const child in state.schedules) {
+    cleanSchedules[child] = {};
+    for (const day in state.schedules[child]) {
+      cleanSchedules[child][day] = flattenEntries(
+        state.schedules[child][day] ?? []
+      ).map(scheduleEntryToObject).filter(Boolean);
+    }
+  }
+
+  // Convert all keys to plain objects (Firestore safe)
   return {
-    children:             state.children,
-    schedules:            state.schedules,
-    starsByChild:         state.starsByChild,
-    badgesByChild:        state.badgesByChild,
-    completedTasks:       state.completedTasks,
-    completedScheduleStars: state.completedScheduleStars,
-    dayByChild:           state.dayByChild,
-    updatedAt:            new Date().toISOString(),
+    children:               [...state.children],
+    schedules:              cleanSchedules,
+    starsByChild:           { ...state.starsByChild },
+    badgesByChild:          { ...state.badgesByChild },
+    completedTasks:         { ...state.completedTasks },
+    completedScheduleStars: { ...state.completedScheduleStars },
+    dayByChild:             { ...state.dayByChild },
+    updatedAt:              new Date().toISOString(),
   };
+}
+function flattenEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+
+  // Recursively unwrap until we get a flat list of string-tuples
+  function unwrap(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+
+    const first = arr[0];
+
+    // Case 1: first item is a string → this IS a single entry, wrap it
+    if (typeof first === "string") return [arr];
+
+    // Case 2: first item is array whose first item is a STRING
+    // → arr is already [ ["05:30", "Fajr", ...], ["07:15", ...] ]
+    if (Array.isArray(first) && typeof first[0] === "string") return arr;
+
+    // Case 2b: first item is a plain object like { time, title, detail, color }
+    // → arr is already Firestore-safe and only needs normalization
+    if (first && typeof first === "object" && !Array.isArray(first)) return arr;
+
+    // Case 3: first item is array whose first item is ALSO an array
+    // → arr is wrapped one extra level, unwrap and retry
+    if (Array.isArray(first) && Array.isArray(first[0])) return unwrap(first);
+
+    return [];
+  }
+
+  const unwrapped = unwrap(entries);
+
+  return unwrapped
+    .map(normalizeScheduleEntry)
+    .filter(Boolean);
+}
+function cleanAllSchedules(schedulesObj) {
+  if (!schedulesObj || typeof schedulesObj !== "object") return {};
+  const clean = {};
+  for (const child in schedulesObj) {
+    clean[child] = {};
+    for (const day in schedulesObj[child]) {
+      const entries = schedulesObj[child][day];
+      const cleaned = flattenEntries(entries ?? []);
+      console.log(`📅 ${child} ${day}: ${cleaned.length} entries`);
+      clean[child][day] = cleaned;
+    }
+  }
+  return clean;
+}
+
+function normalizeScheduleEntry(entry) {
+  if (Array.isArray(entry) && typeof entry[0] === "string") {
+    return [
+      String(entry[0] ?? ""),
+      String(entry[1] ?? ""),
+      String(entry[2] ?? ""),
+      String(entry[3] ?? "peach"),
+    ];
+  }
+
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    return [
+      String(entry.time ?? ""),
+      String(entry.title ?? ""),
+      String(entry.detail ?? ""),
+      String(entry.color ?? "peach"),
+    ];
+  }
+
+  return null;
+}
+
+function scheduleEntryToObject(entry) {
+  const normalized = normalizeScheduleEntry(entry);
+  if (!normalized) return null;
+
+  const [time, title, detail, color] = normalized;
+  return { time, title, detail, color };
+}
+
+function ensureSchedulesForChildren(children, schedulesObj) {
+  const safeSchedules = { ...schedulesObj };
+
+  children.forEach((child) => {
+    if (!safeSchedules[child]) safeSchedules[child] = {};
+
+    plannerData.days.forEach(({ key }) => {
+      const cleanedEntries = flattenEntries(safeSchedules[child][key] ?? []);
+      safeSchedules[child][key] = cleanedEntries.length > 0
+        ? cleanedEntries
+        : JSON.parse(JSON.stringify(plannerData.defaultSchedule[key] ?? []));
+    });
+  });
+
+  return safeSchedules;
 }
 
 // Debounced save — batches rapid changes into one Firestore write
@@ -504,14 +644,10 @@ function renderSchedule() {
   attachScheduleViewEvents();
 }
 
-// BUG FIX: auto-flatten one extra nesting level if schedule data
-// was accidentally double-wrapped (e.g. tue: [ [ [...] ] ] )
 function getScheduleEntries(child, day) {
   const raw = state.schedules[child]?.[day] ?? [];
-  if (raw.length > 0 && Array.isArray(raw[0]) && Array.isArray(raw[0][0])) return raw[0];
-  return raw;
+  return flattenEntries(raw);
 }
-
 function attachScheduleViewEvents() {
   document.getElementById("openScheduleEditorBtn")?.addEventListener("click", () => {
     editorDay = state.day;
@@ -724,19 +860,35 @@ function attachRemoveHandlers(container) {
 }
 
 function saveScheduleEditor() {
-  const entries = Array.from(document.querySelectorAll("#scheduleEditorRows .editor-row"))
+  let entries = Array.from(document.querySelectorAll("#scheduleEditorRows .editor-row"))
     .map(row => {
       const time   = row.querySelector('[data-field="time"]').value;
       const title  = row.querySelector('[data-field="title"]').value.trim();
       const detail = row.querySelector('[data-field="detail"]').value.trim();
       const color  = row.querySelector('[data-field="color"]').value;
+
       if (!time || !title) return null;
-      return [time, title, detail || "Daily routine.", color];
+
+      return {
+        time,
+        title,
+        detail: detail || "Daily routine.",
+        color
+      };
     })
     .filter(Boolean);
 
+  // 🔥 IMPORTANT: convert to NORMAL flat array (NO nested arrays)
+  const flatEntries = entries.map(e => [
+    e.time,
+    e.title,
+    e.detail,
+    e.color
+  ]);
+
   if (!state.schedules[state.child]) state.schedules[state.child] = {};
-  state.schedules[state.child][editorDay] = entries;
+  state.schedules[state.child][editorDay] = flatEntries;
+
   scheduleSave();
   renderAll();
   renderScheduleEditorModal();
